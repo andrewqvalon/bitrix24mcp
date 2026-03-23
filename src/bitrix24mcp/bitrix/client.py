@@ -1,7 +1,8 @@
 """Bitrix24 REST API client.
 
 Handles:
-- Webhook-based authentication (no OAuth needed for read-only / single-tenant use).
+- OAuth2 token-based authentication (preferred) or incoming-webhook URL.
+- Automatic token refresh when the access token expires (401 response).
 - Automatic pagination via ``start`` parameter.
 - Retry on transient errors (5xx, timeouts) with exponential back-off.
 - Rate limiting: Bitrix24 allows 2 req/s; we honour that conservatively.
@@ -10,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Callable, Dict, Generator, List, Optional
 
 import httpx
 from tenacity import (
@@ -38,24 +39,63 @@ class Bitrix24Error(Exception):
 class Bitrix24Client:
     """Thin wrapper around Bitrix24 REST endpoints.
 
+    Supports two authentication modes:
+
+    **Incoming-webhook mode** (simplest, single-tenant):
+        Pass ``webhook_url`` only, e.g.
+        ``https://example.bitrix24.ru/rest/1/TOKEN``.
+        Every REST call is made to ``<webhook_url>/<method>``.
+
+    **OAuth2 mode** (recommended for interactive setup):
+        Pass ``domain`` and ``access_token``.
+        REST calls go to ``https://<domain>/rest/<method>?auth=<access_token>``.
+        Provide ``token_refresher`` (a zero-argument callable that returns a
+        fresh access token) to enable transparent auto-refresh on 401.
+
     Parameters
     ----------
     webhook_url:
-        Base URL for an incoming webhook, e.g.
-        ``https://example.bitrix24.ru/rest/1/TOKEN``.
-        A trailing slash is optional – it will be stripped.
+        Webhook base URL (webhook mode).
+    domain:
+        Portal domain, e.g. ``mycompany.bitrix24.ru`` (OAuth mode).
+    access_token:
+        Current OAuth2 access token (OAuth mode).
+    token_refresher:
+        Optional callable ``() -> str`` that returns a fresh access token
+        when the current one expires.  Used automatically on 401.
     timeout:
         HTTP timeout in seconds for individual requests.
     """
 
-    def __init__(self, webhook_url: str, timeout: float = 30.0) -> None:
-        self._base = webhook_url.rstrip("/")
+    def __init__(
+        self,
+        webhook_url: str = "",
+        domain: str = "",
+        access_token: str = "",
+        token_refresher: Optional[Callable[[], str]] = None,
+        timeout: float = 30.0,
+    ) -> None:
+        if not webhook_url and not (domain and access_token):
+            raise ValueError(
+                "Provide either webhook_url (webhook mode) "
+                "or domain + access_token (OAuth mode)."
+            )
+        self._webhook_base = webhook_url.rstrip("/") if webhook_url else ""
+        self._domain = domain.rstrip("/") if domain else ""
+        self._access_token = access_token
+        self._token_refresher = token_refresher
         self._http = httpx.Client(timeout=timeout)
         self._last_call: float = 0.0
 
     # ------------------------------------------------------------------
     # Low-level helpers
     # ------------------------------------------------------------------
+
+    def _build_url(self, method: str) -> tuple[str, dict]:
+        """Return (url, extra_params) for a REST method call."""
+        if self._webhook_base:
+            return f"{self._webhook_base}/{method}", {}
+        return f"https://{self._domain}/rest/{method}", {"auth": self._access_token}
 
     def _throttle(self) -> None:
         """Ensure at least 0.5 s between successive calls (≤ 2 req/s)."""
@@ -72,16 +112,32 @@ class Bitrix24Client:
     def _request(self, method: str, params: Optional[Dict[str, Any]] = None) -> Any:
         """Make a single Bitrix24 REST call and return parsed JSON result."""
         self._throttle()
-        url = f"{self._base}/{method}"
+        url, extra = self._build_url(method)
+        payload = dict(params or {})
+        payload.update(extra)
         self._last_call = time.monotonic()
         try:
-            resp = self._http.post(url, json=params or {})
+            resp = self._http.post(url, json=payload)
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code >= 500:
+            status = exc.response.status_code
+            if status == 401 and self._token_refresher is not None:
+                # Access token expired – try to refresh once
+                logger.info("Got 401, attempting token refresh")
+                self._access_token = self._token_refresher()
+                # Retry the same call with the new token
+                url, extra = self._build_url(method)
+                payload.update(extra)
+                try:
+                    resp = self._http.post(url, json=payload)
+                    resp.raise_for_status()
+                except httpx.HTTPStatusError as retry_exc:
+                    raise retry_exc
+            elif status >= 500:
                 # Raise as TransportError so tenacity retries
                 raise httpx.TransportError(str(exc)) from exc
-            raise
+            else:
+                raise
         data = resp.json()
         if "error" in data:
             raise Bitrix24Error(

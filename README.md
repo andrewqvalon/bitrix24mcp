@@ -51,26 +51,59 @@ pip install -e ".[webhook]"   # с поддержкой вебхуков
 pip install -e .              # только MCP-сервер
 ```
 
-### 2. Настройка
+### 2. Настройка аутентификации
 
-Скопируйте `.env.example` в `.env` и заполните переменные:
+Есть два способа авторизации. **OAuth2 рекомендуется** — он проще и не требует ручной настройки токенов.
+
+---
+
+#### Способ А: OAuth2 (рекомендуется) — вход через всплывающее окно Bitrix24
+
+**Шаг 1.** Зарегистрируйте приложение Bitrix24:
+1. Откройте `https://www.bitrix24.ru/apps/add.php` (или `/marketplace/app/add/` на вашем портале)
+2. Выберите **«Другое»** → **«Серверное приложение»**
+3. В поле **Redirect URI** укажите: `http://localhost:8765/oauth/callback`
+4. Скопируйте `client_id` (APP.ID) и `client_secret`
+
+**Шаг 2.** Скопируйте `.env.example` в `.env` и заполните:
 
 ```bash
 cp .env.example .env
 ```
 
 ```env
-# Входящий вебхук Bitrix24:
-# Настройки → Разработчикам → Входящие вебхуки → Добавить вебхук
-BITRIX24_WEBHOOK_URL=https://your-domain.bitrix24.ru/rest/1/YOUR_TOKEN/
+BITRIX24_CLIENT_ID=local.YOUR_APP_ID
+BITRIX24_CLIENT_SECRET=YOUR_APP_SECRET
+BITRIX24_REDIRECT_URI=http://localhost:8765/oauth/callback
 
-# PostgreSQL (рекомендуется) или SQLite для разработки:
-DATABASE_URL=postgresql://user:password@localhost:5432/bitrix24mcp
-# DATABASE_URL=sqlite:///bitrix24mcp.sqlite
-
-SYNC_INTERVAL=3600   # Полная пересинхронизация каждые N секунд
-CACHE_TTL=300        # Считать кеш свежим, если моложе N секунд
+DATABASE_URL=sqlite:///bitrix24mcp.sqlite
 ```
+
+**Шаг 3.** Запустите сервер и вызовите инструмент авторизации:
+
+```bash
+bitrix24mcp
+```
+
+В агенте (Claude, Cursor и т.д.) вызовите инструмент:
+```
+authorize_bitrix24
+```
+
+Откроется всплывающее окно Bitrix24 с формой входа. Введите логин и пароль — система автоматически получит и сохранит токены. Больше ничего делать не нужно.
+
+---
+
+#### Способ Б: Входящий вебхук (простой вариант без регистрации приложения)
+
+```env
+BITRIX24_WEBHOOK_URL=https://your-domain.bitrix24.ru/rest/1/YOUR_TOKEN/
+DATABASE_URL=sqlite:///bitrix24mcp.sqlite
+```
+
+Вебхук создаётся в Bitrix24: **Настройки → Разработчикам → Входящие вебхуки → Добавить вебхук**.
+
+---
 
 ### 3. Поднять PostgreSQL (опционально)
 
@@ -88,33 +121,55 @@ bitrix24mcp
 python -m bitrix24mcp
 ```
 
-### 5. Первичная синхронизация
+### 5. Проверить статус авторизации
 
-После запуска сервера вызовите инструмент `sync_crm_data` чтобы наполнить кеш:
-
-```json
-{"tool": "sync_crm_data", "entities": ["contacts", "companies", "deals", "leads", "pipelines"]}
+```
+get_auth_status
 ```
 
-### 6. Вебхуки (опционально)
+### 6. Первичная синхронизация данных
 
-Для обновлений в реальном времени запустите HTTP-обработчик вебхуков:
+```
+sync_crm_data
+```
+
+### 7. Вебхуки реального времени (опционально)
+
+Для мгновенных обновлений при изменениях в CRM запустите HTTP-обработчик:
 
 ```bash
 uvicorn bitrix24mcp.webhook.handler:app --host 0.0.0.0 --port 8080
 ```
 
-И зарегистрируйте в Bitrix24 события:
+Зарегистрируйте в Bitrix24 события на URL `http://your-server:8080/webhook`:
 - `onCrmContactAdd` / `onCrmContactUpdate`
 - `onCrmCompanyAdd` / `onCrmCompanyUpdate`
 - `onCrmDealAdd` / `onCrmDealUpdate`
 - `onCrmLeadAdd` / `onCrmLeadUpdate`
 
-URL вебхука: `http://your-server:8080/webhook`
-
 ## Интеграция с Claude Desktop
 
-Добавьте в `claude_desktop_config.json`:
+### OAuth2 (рекомендуется)
+
+```json
+{
+  "mcpServers": {
+    "bitrix24": {
+      "command": "bitrix24mcp",
+      "env": {
+        "BITRIX24_CLIENT_ID": "local.YOUR_APP_ID",
+        "BITRIX24_CLIENT_SECRET": "YOUR_APP_SECRET",
+        "BITRIX24_REDIRECT_URI": "http://localhost:8765/oauth/callback",
+        "DATABASE_URL": "sqlite:///bitrix24mcp.sqlite"
+      }
+    }
+  }
+}
+```
+
+После запуска сервера один раз вызовите `authorize_bitrix24` — откроется браузер с формой входа Bitrix24.
+
+### Webhook (альтернатива)
 
 ```json
 {

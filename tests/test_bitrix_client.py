@@ -97,8 +97,9 @@ class TestListAll:
 # ---------------------------------------------------------------------------
 
 def test_trailing_slash_stripped():
-    c = Bitrix24Client("https://example.bitrix24.ru/rest/1/tok/")
-    assert c._base == "https://example.bitrix24.ru/rest/1/tok"
+    from bitrix24mcp.bitrix.client import Bitrix24Client
+    c = Bitrix24Client(webhook_url="https://example.bitrix24.ru/rest/1/tok/")
+    assert c._webhook_base == "https://example.bitrix24.ru/rest/1/tok"
 
 
 # ---------------------------------------------------------------------------

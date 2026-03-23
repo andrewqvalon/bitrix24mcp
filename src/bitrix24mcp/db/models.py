@@ -172,3 +172,22 @@ class SyncState(Base):
     entity_type = Column(String(64), primary_key=True)
     last_sync_at = Column(DateTime)
     last_id = Column(BigInteger, default=0)
+
+
+class OAuthToken(Base):
+    """Stores the Bitrix24 OAuth2 tokens obtained via the authorization flow.
+
+    Only one active token row is expected (keyed by ``client_id``).
+    """
+
+    __tablename__ = "oauth_tokens"
+
+    client_id = Column(String(256), primary_key=True)
+    domain = Column(String(256), nullable=False)   # e.g. mycompany.bitrix24.ru
+    member_id = Column(String(256))                 # portal unique identifier
+    access_token = Column(String(1024), nullable=False)
+    refresh_token = Column(String(1024), nullable=False)
+    expires_at = Column(DateTime, nullable=False)   # UTC datetime when access_token expires
+    scope = Column(String(1024))                    # granted OAuth scopes
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

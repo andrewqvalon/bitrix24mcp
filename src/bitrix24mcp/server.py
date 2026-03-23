@@ -5,6 +5,8 @@ Write operations write through to Bitrix24 and then update the cache.
 
 Available tools
 ---------------
+authorize_bitrix24     – interactive OAuth2 login via Bitrix24 browser popup
+get_auth_status        – show current authentication state
 sync_crm_data          – pull fresh data from Bitrix24 into the local cache
 find_contacts          – full-text search for contacts
 get_contact            – get full contact record by ID
@@ -29,17 +31,23 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, List, Optional
 
 import mcp.server.stdio
 import mcp.types as types
 from mcp.server import Server
 
 from bitrix24mcp.bitrix.client import Bitrix24Client, Bitrix24Error
+from bitrix24mcp.bitrix.oauth import (
+    Bitrix24OAuthManager,
+    OAuthError,
+    get_valid_access_token,
+    save_token,
+)
 from bitrix24mcp.config import settings
 from bitrix24mcp.db.database import get_session, init_db
-from bitrix24mcp.db.models import Activity, Company, Contact, Deal, Lead, Pipeline, Stage
+from bitrix24mcp.db.models import Activity, Company, Contact, Deal, Lead, OAuthToken, Pipeline, Stage
 from bitrix24mcp.db.repository import (
     get_timeline,
     search_companies,
@@ -158,12 +166,47 @@ def _activity_to_dict(a: Activity) -> Dict[str, Any]:
 
 
 def _get_client() -> Bitrix24Client:
-    if not settings.bitrix24_webhook_url:
-        raise RuntimeError(
-            "BITRIX24_WEBHOOK_URL is not configured. "
-            "Please set it in the .env file or environment."
-        )
-    return Bitrix24Client(settings.bitrix24_webhook_url)
+    """Build a Bitrix24Client preferring OAuth tokens over webhook URL.
+
+    Priority:
+    1. OAuth token stored in the DB (client_id + client_secret configured).
+    2. Incoming webhook URL from settings.
+    Raises RuntimeError when neither is available.
+    """
+    # -- OAuth mode --
+    if settings.has_oauth_config():
+        with get_session() as session:
+            token_row = session.get(OAuthToken, settings.bitrix24_client_id)
+            if token_row is not None:
+                # Build a refresher callable that uses a fresh session
+                client_id = settings.bitrix24_client_id
+                client_secret = settings.bitrix24_client_secret
+
+                def _refresher() -> str:
+                    with get_session() as s:
+                        tok = get_valid_access_token(s, client_id, client_secret)
+                    if tok is None:
+                        raise RuntimeError("OAuth token not found; please run authorize_bitrix24 again.")
+                    return tok
+
+                # Get a current (possibly refreshed) token
+                access_token = get_valid_access_token(session, client_id, client_secret)
+                if access_token:
+                    return Bitrix24Client(
+                        domain=token_row.domain,
+                        access_token=access_token,
+                        token_refresher=_refresher,
+                    )
+
+    # -- Webhook mode (fallback) --
+    if settings.has_webhook_config():
+        return Bitrix24Client(webhook_url=settings.bitrix24_webhook_url)
+
+    raise RuntimeError(
+        "Bitrix24 is not configured. "
+        "Run the 'authorize_bitrix24' tool to log in via OAuth, "
+        "or set BITRIX24_WEBHOOK_URL in the .env file."
+    )
 
 
 def _text(obj: Any) -> types.TextContent:
@@ -181,6 +224,45 @@ def _text(obj: Any) -> types.TextContent:
 @server.list_tools()
 async def list_tools() -> List[types.Tool]:
     return [
+        types.Tool(
+            name="authorize_bitrix24",
+            description=(
+                "Authorize the MCP server with Bitrix24 via OAuth2. "
+                "Opens a Bitrix24 login popup in your default browser. "
+                "After you log in and approve access, the tokens are saved automatically. "
+                "Requires BITRIX24_CLIENT_ID and BITRIX24_CLIENT_SECRET to be set in .env. "
+                "You only need to do this once; tokens are refreshed automatically after that."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "domain": {
+                        "type": "string",
+                        "description": (
+                            "Your Bitrix24 portal domain, e.g. 'mycompany.bitrix24.ru'. "
+                            "Optional – when omitted, Bitrix24 will ask you to enter it."
+                        ),
+                    },
+                    "port": {
+                        "type": "integer",
+                        "description": "Local port for the OAuth callback server (default: 8765).",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Seconds to wait for login completion (default: 120).",
+                    },
+                },
+            },
+        ),
+        types.Tool(
+            name="get_auth_status",
+            description=(
+                "Show the current Bitrix24 authentication status: "
+                "which auth mode is active (OAuth or webhook), "
+                "the connected portal domain, and when the access token expires."
+            ),
+            inputSchema={"type": "object", "properties": {}},
+        ),
         types.Tool(
             name="sync_crm_data",
             description=(
@@ -463,6 +545,8 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
 
 def _dispatch(name: str, args: Dict[str, Any]) -> Any:
     handlers = {
+        "authorize_bitrix24": _tool_authorize_bitrix24,
+        "get_auth_status": _tool_get_auth_status,
         "sync_crm_data": _tool_sync_crm_data,
         "find_contacts": _tool_find_contacts,
         "get_contact": _tool_get_contact,
@@ -487,6 +571,103 @@ def _dispatch(name: str, args: Dict[str, Any]) -> Any:
     if fn is None:
         raise ValueError(f"Unknown tool: {name}")
     return fn(args)
+
+
+# ------------------------------------------------------------------
+# OAuth authorization
+# ------------------------------------------------------------------
+
+def _tool_authorize_bitrix24(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Start the interactive Bitrix24 OAuth2 flow."""
+    if not settings.has_oauth_config():
+        return {
+            "error": (
+                "OAuth credentials are not configured. "
+                "Add BITRIX24_CLIENT_ID and BITRIX24_CLIENT_SECRET to your .env file. "
+                "You can register a Bitrix24 application at "
+                "https://www.bitrix24.ru/apps/add.php to obtain these credentials."
+            )
+        }
+
+    domain = args.get("domain") or None
+    port = int(args.get("port", 8765))
+    timeout = int(args.get("timeout", 120))
+
+    manager = Bitrix24OAuthManager(
+        client_id=settings.bitrix24_client_id,
+        client_secret=settings.bitrix24_client_secret,
+        redirect_uri=settings.bitrix24_redirect_uri,
+    )
+    try:
+        token_data = manager.authorize_interactive(domain=domain, port=port, timeout=timeout)
+    finally:
+        manager.close()
+
+    with get_session() as session:
+        save_token(session, settings.bitrix24_client_id, token_data)
+
+    return {
+        "status": "authorized",
+        "domain": token_data.get("domain", ""),
+        "member_id": token_data.get("member_id", ""),
+        "scope": token_data.get("scope", ""),
+        "message": "Authorization successful. Tokens saved. You can now use all CRM tools.",
+    }
+
+
+def _tool_get_auth_status(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the current Bitrix24 authentication status."""
+    status: Dict[str, Any] = {
+        "oauth_config_present": settings.has_oauth_config(),
+        "webhook_config_present": settings.has_webhook_config(),
+    }
+
+    if settings.has_oauth_config():
+        with get_session() as session:
+            token_row = session.get(OAuthToken, settings.bitrix24_client_id)
+            if token_row is None:
+                token_info = None
+            else:
+                # Read all fields while the session is still open
+                token_info = {
+                    "expires_at": token_row.expires_at,
+                    "domain": token_row.domain,
+                    "member_id": token_row.member_id,
+                    "scope": token_row.scope,
+                }
+
+        if token_info is None:
+            status["oauth_token"] = "not_authorized"
+            status["message"] = (
+                "OAuth credentials are configured but no token exists yet. "
+                "Call 'authorize_bitrix24' to log in."
+            )
+        else:
+            expires_at = token_info["expires_at"]
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            is_valid = now < expires_at
+            status["oauth_token"] = "valid" if is_valid else "expired"
+            status["domain"] = token_info["domain"]
+            status["member_id"] = token_info["member_id"]
+            status["scope"] = token_info["scope"]
+            status["expires_at"] = expires_at.isoformat()
+            status["message"] = (
+                f"Connected to {token_info['domain']} via OAuth2. "
+                f"Token {'is valid' if is_valid else 'has expired (will auto-refresh)'}."
+            )
+    elif settings.has_webhook_config():
+        status["active_mode"] = "webhook"
+        status["message"] = f"Using webhook URL: {settings.bitrix24_webhook_url}"
+    else:
+        status["active_mode"] = "none"
+        status["message"] = (
+            "Not configured. Set BITRIX24_CLIENT_ID + BITRIX24_CLIENT_SECRET (OAuth) "
+            "or BITRIX24_WEBHOOK_URL (webhook) in your .env file."
+        )
+
+    return status
 
 
 # ------------------------------------------------------------------
