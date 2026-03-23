@@ -1,0 +1,13 @@
+services:
+  bitrix24mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bitrix24mcp
+    env_file:
+      - .env
+    ports:
+      - "4310:4310"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
