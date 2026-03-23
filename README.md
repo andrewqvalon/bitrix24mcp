@@ -22,7 +22,7 @@ MCP сервер для CRM Bitrix24 с OAuth2 авторизацией и за�
 
 - Docker + Docker Compose
 - Зарегистрированное OAuth приложение в Bitrix24
-- Публичный callback URL (в вашем случае: `https://orion.mdaudit.ru/auth/bitrix/callback`)
+- Публичный callback URL (должен совпадать с `BITRIX_REDIRECT_URI`)
 
 ## Настройка `.env`
 
@@ -36,7 +36,9 @@ cp .env.example .env
 
 - `BITRIX_CLIENT_ID`
 - `BITRIX_CLIENT_SECRET`
-- `BITRIX_REDIRECT_URI` (должен совпадать с redirect URI в приложении Bitrix24)
+- `BITRIX_REDIRECT_URI` (один из вариантов):
+  - через reverse proxy: `https://orion.mdaudit.ru/auth/bitrix/callback`
+  - напрямую к контейнеру: `http://orion.mdaudit.ru:4310/auth/bitrix/callback`
 
 Рекомендуемые:
 
@@ -60,13 +62,15 @@ curl http://localhost:4310/auth/status
 
 ## Как пройти авторизацию Bitrix24
 
-1. Откройте:
-   - `https://orion.mdaudit.ru/auth/bitrix/start`
+1. Откройте `auth/start` по той же схеме, что и `BITRIX_REDIRECT_URI`:
+   - `https://orion.mdaudit.ru/auth/bitrix/start` (если настроен reverse proxy)
+   - `http://orion.mdaudit.ru:4310/auth/bitrix/start` (напрямую по порту)
 2. Подтвердите доступ в интерфейсе Bitrix24.
 3. После редиректа на callback вы получите сообщение:
    - `Bitrix24 authorization complete. You can return to your MCP client.`
 4. Проверьте статус:
    - `https://orion.mdaudit.ru/auth/status`
+   - или `http://orion.mdaudit.ru:4310/auth/status`
    - `authorized` должно быть `true`.
 
 ## Подключение MCP-клиента
@@ -77,7 +81,7 @@ curl http://localhost:4310/auth/status
 {
   "mcpServers": {
     "bitrix24-http": {
-      "url": "https://orion.mdaudit.ru/mcp"
+      "url": "http://orion.mdaudit.ru:4310/mcp"
     }
   }
 }
